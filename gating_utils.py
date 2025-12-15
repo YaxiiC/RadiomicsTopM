@@ -44,3 +44,44 @@ def gumbel_topk_ste_mask(logits: torch.Tensor, k: int, tau: float, lam: float) -
     z_hard = hard_topk_mask(logits_noisy, k)
     s = torch.sigmoid(logits / tau)
     return z_hard + (s - s.detach())
+
+
+def compose_continuous_topm_weights(z_hard: torch.Tensor, w_soft: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compose continuous Top-M weights with a single soft factor in the forward pass.
+
+    Args:
+        z_hard: Hard top-M mask (k-hot).
+        w_soft: Soft weights computed from logits / temperature.
+
+    Returns:
+        weights: Forward weights using ``z_hard * w_soft`` while attaching gradients via STE.
+        z_st: Straight-through mask used for gradient flow.
+    """
+
+    z_st = z_hard + (w_soft - w_soft.detach())
+    weights_fwd = z_hard * w_soft
+
+    # Attach the gradient from z_st without changing the forward value.
+    delta = z_st - z_hard
+    weights = weights_fwd + delta - delta.detach()
+
+    if torch.is_grad_enabled():
+        forward_diff = (weights.detach() - weights_fwd.detach()).abs().max()
+        assert forward_diff < 1e-6, f"Continuous gating forward mismatch: max diff {forward_diff.item()}"
+
+    return weights, z_st
+
+
+def debug_check_continuous_gating(batch: int = 2, feat_dim: int = 8, top_m: int = 3, tau: float = 0.5):
+    """Run a quick forward/backward sanity check for continuous Top-M gating."""
+
+    logits = torch.randn(batch, feat_dim, requires_grad=True)
+    w_soft = torch.sigmoid(logits / tau)
+    z_hard = hard_topk_mask(logits, top_m)
+    weights, _ = compose_continuous_topm_weights(z_hard, w_soft)
+
+    loss = weights.sum()
+    loss.backward()
+
+    print(f"max|weights - z_hard*w_soft|: {(weights - z_hard * w_soft).abs().max().item():.6f}")
+    print(f"logits grad norm: {logits.grad.norm().item():.6f}")
