@@ -513,6 +513,7 @@ def train_cnn_with_masking(
     tau_schedule = gating_cfg.get("tau_schedule", ((2.0, 1.0), (1.0, 0.3), (0.3, 0.1)))
     lam_schedule = gating_cfg.get("lam_schedule", ((0.0, 0.0), (1.0, 0.2), (0.0, 0.0)))
     gating_state_fn = build_stage_scheduler(num_epochs, stage_ratios, tau_schedule, lam_schedule)
+    tau_infer = gating_cfg.get("tau_infer", tau_schedule[-1][-1] if tau_schedule else 0.1)
 
 
 
@@ -645,8 +646,11 @@ def train_cnn_with_masking(
                 #print(f"[DEBUG] Validation Features - Std: {torch.std(feats_1824).item():.6f}")
                 #print(f"[DEBUG] Validation Features - Min: {torch.min(feats_1824).item():.6f}, Max: {torch.max(feats_1824).item():.6f}")
 
+                gating_state = None
+                if gating_cfg.get("enabled", False):
+                    gating_state = {"stage": "inference", "tau": tau_infer, "lam": 0.0}
 
-                logits = model(images_3d, feats_1824)
+                logits = model(images_3d, feats_1824, gating_state=gating_state)
                 loss = criterion(logits, labels)
                 val_loss += loss.item()
 
@@ -746,7 +750,11 @@ def train_cnn_with_masking(
         for images_3d, feats_1824, labels in val_loader:
             images_3d = images_3d.to(device)
             feats_1824 = feats_1824.to(device)
-            logits = model(images_3d, feats_1824)
+            gating_state = None
+            if gating_cfg.get("enabled", False):
+                gating_state = {"stage": "inference", "tau": tau_infer, "lam": 0.0}
+
+            logits = model(images_3d, feats_1824, gating_state=gating_state)
             probs = torch.sigmoid(logits).cpu()
             all_probs_val.append(probs)
             all_labels_val.append(labels[:, 1].unsqueeze(1).cpu())
@@ -781,8 +789,8 @@ def evaluate_model(model, loader, device, thresholds=None, output_log_file=None,
             gating_state = None
             if gating_config and gating_config.get("enabled", False):
                 tau_schedule = gating_config.get("tau_schedule", ((0.3, 0.1),))
-                tau_default = tau_schedule[-1][-1] if tau_schedule else 0.1
-                gating_state = {"stage": "inference", "tau": tau_default, "lam": 0.0}
+                tau_infer = gating_config.get("tau_infer", tau_schedule[-1][-1] if tau_schedule else 0.1)
+                gating_state = {"stage": "inference", "tau": tau_infer, "lam": 0.0}
 
             logits = model(images_3d, feats_1824, gating_state=gating_state)  # => [B,3]
             probs  = torch.sigmoid(logits)
@@ -1014,11 +1022,13 @@ if __name__ == "__main__":
         "enabled": True,
         "top_m": 50,
         "use_continuous_weight_on_selected": True,
+        "weight_mode": "continuous",
         "alpha_l1": 1e-4,
         "sparsity_enabled": True,
         "stage_ratios": (0.4, 0.4, 0.2),
         "tau_schedule": ((2.0, 1.0), (1.0, 0.3), (0.3, 0.1)),
         "lam_schedule": ((0.0, 0.0), (1.0, 0.2), (0.0, 0.0)),
+        "tau_infer": 0.1,
     }
 
     cnn_model = GlobalMaskedFeatureSelector(in_channels=3, out_features=2568, save_path = feature_importance_path)

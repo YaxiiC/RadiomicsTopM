@@ -13,9 +13,11 @@ The classifier remains a linear logistic regression head applied on masked radio
 1. Configure `gating_config` in `classifier_training_acl.py` to set:
    - `enabled`: turn the Top-M curriculum on/off (keeps backward compatibility when `False`).
    - `top_m`: number of radiomics features to keep per sample.
-   - `use_continuous_weight_on_selected`: multiply the hard mask by sigmoid logits for smoother weighting.
+   - `weight_mode`: `"binary"` (mask only) or `"continuous"` (mask times one sigmoid scale per selected feature). The legacy
+     `use_continuous_weight_on_selected` flag is still honored for backwards compatibility.
    - `alpha_l1` / `sparsity_enabled`: sparsity regularization strength and toggle.
    - `stage_ratios`, `tau_schedule`, `lam_schedule`: stage durations plus temperature/noise annealing.
+   - `tau_infer`: temperature used during validation/test inference when `stage="inference"`.
 2. Instantiate the model with `CNNWithGlobalMasking(..., gating_config=gating_config)`.
 3. Train with `train_cnn_with_masking(..., gating_config=gating_config)`. The loop prints the current stage, temperature, noise level, and average selected features each epoch.
 4. Evaluate with `evaluate_model(..., gating_config=gating_config)`, which enforces deterministic Top-M masking.
