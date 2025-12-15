@@ -119,42 +119,62 @@ class CNNWithGlobalMasking(nn.Module):
         return logits
 
     def _apply_topm_gating(self, logits, radiomics_feats, gating_state=None):
-        from gating_utils import hard_topk_mask, ste_topk_mask, gumbel_topk_ste_mask
+        from gating_utils import hard_topk_mask, sample_gumbel
 
         cfg = self.gating_config
         gating_state = gating_state or {}
-        tau = gating_state.get("tau", cfg.get("tau_default", 1.0))
+        tau_sched_default = cfg.get("tau_default", 1.0)
+        tau_infer = cfg.get("tau_infer", cfg.get("tau_schedule", ((tau_sched_default, tau_sched_default),))[-1][-1] if cfg.get("tau_schedule") else 0.1)
+        tau = gating_state.get("tau", tau_sched_default)
         lam = gating_state.get("lam", 0.0)
         stage = gating_state.get("stage", "inference")
         top_m = cfg.get("top_m", radiomics_feats.shape[1])
-        use_continuous = cfg.get("use_continuous_weight_on_selected", False)
+        weight_mode = cfg.get("weight_mode")
+        if weight_mode is None:
+            # Backward compatibility with the old boolean flag.
+            weight_mode = "continuous" if cfg.get("use_continuous_weight_on_selected", False) else "binary"
 
-        if not self.training:
-            hard_mask = hard_topk_mask(logits, top_m)
-            soft = torch.sigmoid(logits / max(tau, 1e-6))
-            weights = hard_mask * soft if use_continuous else hard_mask
-            selected_mask = hard_mask.detach()
-        else:
-            if stage == "stage1":
-                weights = torch.sigmoid(logits / max(tau, 1e-6))
-                selected_mask = (weights > 0).float().detach()
-            elif stage == "stage2":
-                z_st = gumbel_topk_ste_mask(logits, top_m, tau, lam)
-                soft = torch.sigmoid(logits)
-                weights = z_st * soft if use_continuous else z_st
-                selected_mask = z_st.detach()
-            else:  # stage3 or default
-                z_st = ste_topk_mask(logits, top_m, tau)
-                soft = torch.sigmoid(logits)
-                weights = z_st * soft if use_continuous else z_st
-                selected_mask = z_st.detach()
+        # Use a consistent temperature for the soft path.
+        tau_eff = tau_infer if stage == "inference" else tau
+        tau_eff = max(tau_eff, 1e-6)
+        w_soft = torch.sigmoid(logits / tau_eff)
+
+        if stage == "stage1":
+            # Soft warm-up: no hard mask in the forward pass.
+            weights = w_soft
+            selected_mask = hard_topk_mask(logits, top_m).detach()
+        elif stage == "stage2":
+            g = sample_gumbel(logits.shape, device=logits.device) if lam > 0 else 0.0
+            logits_noisy = logits + lam * g if lam > 0 else logits
+            z_hard = hard_topk_mask(logits_noisy, top_m)
+            z_st = z_hard + (w_soft - w_soft.detach())
+            if weight_mode == "continuous":
+                weights = z_st * w_soft
+            else:
+                weights = z_st
+            selected_mask = z_hard.detach()
+        elif stage == "stage3":
+            z_hard = hard_topk_mask(logits, top_m)
+            z_st = z_hard + (w_soft - w_soft.detach())
+            if weight_mode == "continuous":
+                weights = z_st * w_soft
+            else:
+                weights = z_st
+            selected_mask = z_hard.detach()
+        else:  # inference or any other stage treated as inference
+            z_hard = hard_topk_mask(logits, top_m)
+            if weight_mode == "continuous":
+                weights = z_hard * w_soft
+            else:
+                weights = z_hard
+            selected_mask = z_hard.detach()
 
         masked_feats = radiomics_feats * weights
 
         gating_outputs = {
             "weights": weights,
             "selected_mask": selected_mask,
-            "tau": tau,
+            "tau": tau_eff,
             "lam": lam,
             "stage": stage,
         }
