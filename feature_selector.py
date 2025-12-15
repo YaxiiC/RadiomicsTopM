@@ -31,7 +31,7 @@ class GlobalMaskedFeatureSelector(nn.Module):
         self.dropout = nn.Dropout(p=dropout_prob)
 
 
-    def forward(self, x):
+    def forward(self, x, return_logits: bool = False):
         """
         x shape: [B, in_channels=3, D=32, H=128, W=128].
         Returns: [B, out_features=1842].
@@ -40,6 +40,8 @@ class GlobalMaskedFeatureSelector(nn.Module):
         x = torch.flatten(x, start_dim=1)  # Shape: [B, C]
         x = self.dropout(x) 
         x = self.fc(x)  # Map to feature space [B, 1824]
+        if return_logits:
+            return x
         patient_specific_probs = torch.sigmoid(x)  # Element-wise sigmoid to yield probabilities in [0, 1]
         return patient_specific_probs
 
@@ -71,7 +73,7 @@ class GlobalMaskedFeatureSelector(nn.Module):
 
 
 class CNNWithGlobalMasking(nn.Module):
-    def __init__(self, cnn_model, lr_model, dropout_prob=0.7):
+    def __init__(self, cnn_model, lr_model, dropout_prob=0.7, gating_config=None):
         """
         cnn_model:   A CNN that outputs a global mask [1, feature_dim].
         lr_model:    The logistic regression (InteractionLogisticRegression).
@@ -79,28 +81,84 @@ class CNNWithGlobalMasking(nn.Module):
         super(CNNWithGlobalMasking, self).__init__()
         self.cnn_model = cnn_model
         self.lr_model = lr_model
-        #self.selected_features_mask = selected_features_mask 
+        self.gating_config = gating_config or {"enabled": False}
         self.dropout = nn.Dropout(p=dropout_prob)
 
-    def forward(self, images_3d, radiomics_feats):
+    def forward(self, images_3d, radiomics_feats, gating_state=None, return_gating=False):
         """
         images_3d:      [B, 3, D, H, W]
         radiomics_feats:[B, 1842]
         Returns:        [B, 3] logits for multi-label classification
         """
         # 1) Generate the global mask
-        feature_importance = self.cnn_model(images_3d)  # [B, out_features]
-        
+        gating_cfg = self.gating_config or {}
+        use_gating = gating_cfg.get("enabled", False)
+        if use_gating:
+            feature_logits = self.cnn_model(images_3d, return_logits=True)
+        else:
+            feature_logits = self.cnn_model(images_3d)
+
         radiomics_feats = self.dropout(radiomics_feats)
 
-        if feature_importance.shape[1] != radiomics_feats.shape[1]:
-            raise ValueError(f"[ERROR] Mismatch: feature_importance.shape={feature_importance.shape}, expected radiomics_feats.shape[1]={radiomics_feats.shape[1]}")
-        
-        # Multiply (element-wise) the radiomics features by the patient-specific probabilities.
-        masked_feats = radiomics_feats * feature_importance
+        if feature_logits.shape[1] != radiomics_feats.shape[1]:
+            raise ValueError(f"[ERROR] Mismatch: feature_importance.shape={feature_logits.shape}, expected radiomics_feats.shape[1]={radiomics_feats.shape[1]}")
 
-        logits = self.lr_model(masked_feats) 
+        if use_gating:
+            masked_feats, gating_outputs = self._apply_topm_gating(feature_logits, radiomics_feats, gating_state)
+        else:
+            feature_importance = torch.sigmoid(feature_logits)
+            masked_feats = radiomics_feats * feature_importance
+            gating_outputs = {
+                "weights": feature_importance.detach(),
+                "selected_mask": (feature_importance > 0).float().detach(),
+            }
+
+        logits = self.lr_model(masked_feats)
+        if return_gating:
+            return logits, gating_outputs
         return logits
+
+    def _apply_topm_gating(self, logits, radiomics_feats, gating_state=None):
+        from gating_utils import hard_topk_mask, ste_topk_mask, gumbel_topk_ste_mask
+
+        cfg = self.gating_config
+        gating_state = gating_state or {}
+        tau = gating_state.get("tau", cfg.get("tau_default", 1.0))
+        lam = gating_state.get("lam", 0.0)
+        stage = gating_state.get("stage", "inference")
+        top_m = cfg.get("top_m", radiomics_feats.shape[1])
+        use_continuous = cfg.get("use_continuous_weight_on_selected", False)
+
+        if not self.training:
+            hard_mask = hard_topk_mask(logits, top_m)
+            soft = torch.sigmoid(logits / max(tau, 1e-6))
+            weights = hard_mask * soft if use_continuous else hard_mask
+            selected_mask = hard_mask.detach()
+        else:
+            if stage == "stage1":
+                weights = torch.sigmoid(logits / max(tau, 1e-6))
+                selected_mask = (weights > 0).float().detach()
+            elif stage == "stage2":
+                z_st = gumbel_topk_ste_mask(logits, top_m, tau, lam)
+                soft = torch.sigmoid(logits)
+                weights = z_st * soft if use_continuous else z_st
+                selected_mask = z_st.detach()
+            else:  # stage3 or default
+                z_st = ste_topk_mask(logits, top_m, tau)
+                soft = torch.sigmoid(logits)
+                weights = z_st * soft if use_continuous else z_st
+                selected_mask = z_st.detach()
+
+        masked_feats = radiomics_feats * weights
+
+        gating_outputs = {
+            "weights": weights,
+            "selected_mask": selected_mask,
+            "tau": tau,
+            "lam": lam,
+            "stage": stage,
+        }
+        return masked_feats, gating_outputs
 
 
     

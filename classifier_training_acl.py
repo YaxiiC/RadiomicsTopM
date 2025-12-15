@@ -16,6 +16,7 @@ from reconstruction_model import UNet3D
 #from diffusion_model import DDPM3D
 from classifier import InteractionLogisticRegression
 from feature_selector import GlobalMaskedFeatureSelector, CNNWithGlobalMasking
+from gating_utils import hard_topk_mask
 
 
 
@@ -29,6 +30,39 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.feature_selection import VarianceThreshold
 import torch.optim as optim
 import json
+
+
+def linear_interpolate(start: float, end: float, ratio: float) -> float:
+    ratio = float(np.clip(ratio, 0.0, 1.0))
+    return start + (end - start) * ratio
+
+
+def build_stage_scheduler(num_epochs, stage_ratios, tau_schedule, lam_schedule):
+    stage1_epochs = int(num_epochs * stage_ratios[0])
+    stage2_epochs = int(num_epochs * stage_ratios[1])
+    stage3_epochs = num_epochs - stage1_epochs - stage2_epochs
+
+    boundaries = [stage1_epochs, stage1_epochs + stage2_epochs]
+
+    def get_params(epoch):
+        if epoch < boundaries[0]:
+            stage = "stage1"
+            progress = epoch / max(stage1_epochs, 1)
+            tau = linear_interpolate(tau_schedule[0][0], tau_schedule[0][1], progress)
+            lam = linear_interpolate(lam_schedule[0][0], lam_schedule[0][1], progress)
+        elif epoch < boundaries[1]:
+            stage = "stage2"
+            progress = (epoch - boundaries[0]) / max(stage2_epochs, 1)
+            tau = linear_interpolate(tau_schedule[1][0], tau_schedule[1][1], progress)
+            lam = linear_interpolate(lam_schedule[1][0], lam_schedule[1][1], progress)
+        else:
+            stage = "stage3"
+            progress = (epoch - boundaries[1]) / max(stage3_epochs, 1)
+            tau = linear_interpolate(tau_schedule[2][0], tau_schedule[2][1], progress)
+            lam = linear_interpolate(lam_schedule[2][0], lam_schedule[2][1], progress)
+        return stage, tau, lam
+
+    return get_params
 
 
 # ------------------------------------------
@@ -427,9 +461,9 @@ def find_best_thresholds_youden(probabilities, labels, min_threshold=0.1):
 
 
 def train_cnn_with_masking(
-    model, 
-    train_loader, 
-    val_loader, 
+    model,
+    train_loader,
+    val_loader,
     device='cuda',
     num_epochs=10000,
     lr=1e-3,
@@ -438,7 +472,8 @@ def train_cnn_with_masking(
     model_save_path='combined_model_acl.pth',
     update_threshold_every=5,
     feature_importance_path='feature_importance.json',
-    save_every=20
+    save_every=20,
+    gating_config=None
 ):
     """
     model: CNNWithFeatureMasking
@@ -473,6 +508,12 @@ def train_cnn_with_masking(
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=5e-4, steps_per_epoch=len(train_loader), epochs=num_epochs)
 
+    gating_cfg = gating_config or {"enabled": False}
+    stage_ratios = gating_cfg.get("stage_ratios", (0.4, 0.4, 0.2))
+    tau_schedule = gating_cfg.get("tau_schedule", ((2.0, 1.0), (1.0, 0.3), (0.3, 0.1)))
+    lam_schedule = gating_cfg.get("lam_schedule", ((0.0, 0.0), (1.0, 0.2), (0.0, 0.0)))
+    gating_state_fn = build_stage_scheduler(num_epochs, stage_ratios, tau_schedule, lam_schedule)
+
 
 
     best_val_f1 = 0.0
@@ -486,6 +527,8 @@ def train_cnn_with_masking(
         running_loss = 0.0
         all_train_probs = []
         all_train_labels = []
+        stage, tau, lam = gating_state_fn(epoch)
+        epoch_selected_counts = []
 
         for images_3d, feats_1824, labels in train_loader:
             images_3d = images_3d.to(device)     # [B, 3, D, H, W]
@@ -514,9 +557,27 @@ def train_cnn_with_masking(
 
 
 
-            logits = model(images_3d, feats_1824)  # => [B, 3]
+            gating_state = None
+            return_gating = False
+            if gating_cfg.get("enabled", False):
+                gating_state = {"tau": tau, "lam": lam, "stage": stage}
+                return_gating = True
+
+            outputs = model(images_3d, feats_1824, gating_state=gating_state, return_gating=return_gating)  # => [B, 3]
+            if return_gating:
+                logits, gating_outputs = outputs
+            else:
+                logits = outputs
+                gating_outputs = None
             #print(f"[DEBUG] First 10 Raw Model Outputs: {logits[:10].detach().cpu().numpy()}")
             loss = criterion(logits, smoothed_labels)
+            if gating_outputs and gating_cfg.get("sparsity_enabled", True):
+                alpha = gating_cfg.get("alpha_l1", 0.0)
+                if alpha > 0:
+                    loss = loss + alpha * gating_outputs["weights"].sum(dim=1).mean()
+            if gating_outputs is not None:
+                epoch_selected_counts.append(gating_outputs["selected_mask"].sum(dim=1).mean().item())
+
             loss.backward()
             optimizer.step()
 
@@ -528,6 +589,10 @@ def train_cnn_with_masking(
             all_train_labels.append(labels.cpu())
 
         train_loss = running_loss / len(train_loader)
+
+        avg_selected = float(np.mean(epoch_selected_counts)) if len(epoch_selected_counts) > 0 else 0.0
+        if gating_cfg.get("enabled", False):
+            print(f"[INFO] Epoch {epoch+1}/{num_epochs} | stage={stage} | tau={tau:.3f} | lam={lam:.3f} | avg selected={avg_selected:.2f}")
 
         all_train_probs = torch.cat(all_train_probs, dim=0)
         all_train_labels = torch.cat(all_train_labels, dim=0)
@@ -702,7 +767,7 @@ def train_cnn_with_masking(
 
 
 
-def evaluate_model(model, loader, device, thresholds=None, output_log_file=None):
+def evaluate_model(model, loader, device, thresholds=None, output_log_file=None, gating_config=None):
     model.eval()
     all_probs  = []
     all_labels = []
@@ -713,7 +778,13 @@ def evaluate_model(model, loader, device, thresholds=None, output_log_file=None)
             feats_1824 = feats_1824.to(device)
             labels_3   = labels_3.to(device)
 
-            logits = model(images_3d, feats_1824)  # => [B,3]
+            gating_state = None
+            if gating_config and gating_config.get("enabled", False):
+                tau_schedule = gating_config.get("tau_schedule", ((0.3, 0.1),))
+                tau_default = tau_schedule[-1][-1] if tau_schedule else 0.1
+                gating_state = {"stage": "inference", "tau": tau_default, "lam": 0.0}
+
+            logits = model(images_3d, feats_1824, gating_state=gating_state)  # => [B,3]
             probs  = torch.sigmoid(logits)
 
             all_probs.append(probs)  # Keep on the same device as `probs`
@@ -944,11 +1015,22 @@ if __name__ == "__main__":
     all_features_np = np.vstack(all_features)
 
 
+    gating_config = {
+        "enabled": True,
+        "top_m": 50,
+        "use_continuous_weight_on_selected": True,
+        "alpha_l1": 1e-4,
+        "sparsity_enabled": True,
+        "stage_ratios": (0.4, 0.4, 0.2),
+        "tau_schedule": ((2.0, 1.0), (1.0, 0.3), (0.3, 0.1)),
+        "lam_schedule": ((0.0, 0.0), (1.0, 0.2), (0.0, 0.0)),
+    }
+
     cnn_model = GlobalMaskedFeatureSelector(in_channels=3, out_features=2568, save_path = feature_importance_path)
 
     lr_model  = InteractionLogisticRegression(input_size=2568, output_size=1)
 
-    combined_model = CNNWithGlobalMasking(cnn_model=cnn_model, lr_model=lr_model)
+    combined_model = CNNWithGlobalMasking(cnn_model=cnn_model, lr_model=lr_model, gating_config=gating_config)
     combined_model = combined_model.to(device)
 
 
@@ -965,7 +1047,8 @@ if __name__ == "__main__":
         weight_decay=1e-3,
         patience=150,
         model_save_path=best_model_path,
-        feature_importance_path=feature_importance_path
+        feature_importance_path=feature_importance_path,
+        gating_config=gating_config
     )
     print("Done!")
     trained_model.cnn_model.save_feature_importance()
