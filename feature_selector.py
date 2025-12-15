@@ -119,7 +119,7 @@ class CNNWithGlobalMasking(nn.Module):
         return logits
 
     def _apply_topm_gating(self, logits, radiomics_feats, gating_state=None):
-        from gating_utils import hard_topk_mask, sample_gumbel
+        from gating_utils import compose_continuous_topm_weights, hard_topk_mask, sample_gumbel
 
         cfg = self.gating_config
         gating_state = gating_state or {}
@@ -147,18 +147,18 @@ class CNNWithGlobalMasking(nn.Module):
             g = sample_gumbel(logits.shape, device=logits.device) if lam > 0 else 0.0
             logits_noisy = logits + lam * g if lam > 0 else logits
             z_hard = hard_topk_mask(logits_noisy, top_m)
-            z_st = z_hard + (w_soft - w_soft.detach())
             if weight_mode == "continuous":
-                weights = z_st * w_soft
+                weights, z_st = compose_continuous_topm_weights(z_hard, w_soft)
             else:
+                z_st = z_hard + (w_soft - w_soft.detach())
                 weights = z_st
             selected_mask = z_hard.detach()
         elif stage == "stage3":
             z_hard = hard_topk_mask(logits, top_m)
-            z_st = z_hard + (w_soft - w_soft.detach())
             if weight_mode == "continuous":
-                weights = z_st * w_soft
+                weights, z_st = compose_continuous_topm_weights(z_hard, w_soft)
             else:
+                z_st = z_hard + (w_soft - w_soft.detach())
                 weights = z_st
             selected_mask = z_hard.detach()
         else:  # inference or any other stage treated as inference
