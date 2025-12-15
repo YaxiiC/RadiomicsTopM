@@ -12,7 +12,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 import matplotlib.patches as patches
 from sklearn.metrics import roc_auc_score, confusion_matrix, f1_score
 
-from reconstruction_model import UNet3D
+#from reconstruction_model import UNet3D
 #from diffusion_model import DDPM3D
 from classifier import InteractionLogisticRegression
 from feature_selector import GlobalMaskedFeatureSelector, CNNWithGlobalMasking
